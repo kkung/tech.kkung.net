@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="//fonts.googleapis.com/css?family=Source+Sans+Pro:300,300i,600">
+<link rel="stylesheet" href="../../static/gen/styles.css?h=a818600a">
+<title>Nginx를 ELB Reverse Proxy로 사용할때 주의 점 — tech.kkung.net</title>
+ 
+</head>
+<body>
+  <div class="container">
+  <header class="masthead">
+    <h1 class="masthead-title">
+      <a href="/">tech.kkung.net</a>
+    </h1>
+    <nav class="masthead-nav">
+        
+          <a href="../../blog/">Blog</a>
+        
+    </nav>
+   </header>
+   
+  
+  <div class="content post">
+  <h1 class="post-title">Nginx를 ELB Reverse Proxy로 사용할때 주의 점</h1>
+  <div class="post-date">
+    <time>2016-02-22</time>
+  </div>
+  <p>Nginx를 ELB의 Reverse Proxy로 사용할때 주의 점</p>
+<p>(이 글은 <a href="http://tenzer.dk/nginx-with-dynamic-upstreams/">Nginx with dynamic upstreams</a> 내용을 참고하여 작성되었습니다)</p>
+<p><a href="https://beatpacking.com">비트</a>는 서버 구성요소를 크게 목적에 따라 몇가지 분류로 구분하여 사용하고 있으며, 해당 서버 그룹의 Load balacing을 위하여 ELB를 이용하고 있다.</p>
+<p><img src="beat.png" alt="BEAT-DG" title="비트 Internal ELB"></p>
+<p>최근, 급격한 트래픽 증가시점이나, 비정기적으로 ELB상의 HTTP Error가 증가하는 경우가 발견하여 문제를 추적하던 도중, Nginx에서 <code>upstream timeout</code> 혹은 <code>upstream connection failed</code> 같은 오류가 관측되는 경우를 확인하였다.</p>
+<p><a href="http://aws.amazon.com/ko/elasticloadbalancing/">ELB</a>는 외부 용도(Internet facing)뿐 아니라, 내부 서비스들의 Load balacner로 쓰기에도 매우 훌륭하다. 특히 서비스 인스턴스군을 Autoscaling Group으로 관리할 경우, 적절한 Healthy check를 통한 가용성 관리와 서비스 등록&amp;해제는 무척 편리한다. 무엇보다, 이런점들과 함께 '알아서 스케일 되는' ELB는 무척 편리한 서비스임에 틀림 없다.</p>
+<p>물론 이렇게 무척 편리한 <a href="http://aws.amazon.com/ko/elasticloadbalancing/">ELB</a>이지만, 특히 Internal Load Balancer로 쓸 때에는 몇가지 고려 사항이 있다.</p>
+<ul>
+<li>ELB의 IP는 변경될 수 있다.</li>
+<li>ELB의 IP는 단일 IP가 아니라, 복수의 IP로 제공된다</li>
+</ul>
+<p>예를들어,</p>
+<div class="highlight"><pre><span></span>ubuntu@ip-10-167-5-68:~$ dig foo.beatpacking.com
+
+<span class="p">;</span> &lt;&lt;&gt;&gt; DiG 9.9.5-3ubuntu0.2-Ubuntu &lt;&lt;&gt;&gt; foo.beatpacking.com
+<span class="p">;;</span> global options: +cmd
+<span class="p">;;</span> Got answer:
+<span class="p">;;</span> -&gt;&gt;HEADER<span class="s">&lt;&lt;- opco</span>de: QUERY, status: NOERROR, id: 15618
+<span class="p">;;</span> flags: qr rd ra<span class="p">;</span> QUERY: 1, ANSWER: 8, AUTHORITY: 0, ADDITIONAL: 1
+
+<span class="p">;;</span> OPT PSEUDOSECTION:
+<span class="p">;</span> EDNS: version: 0, flags:<span class="p">;</span> udp: 4096
+<span class="p">;;</span> QUESTION SECTION:
+<span class="p">;</span>foo.beatpacking.com.      IN      A
+
+<span class="p">;;</span> ANSWER SECTION:
+foo.beatpacking.com. <span class="m">60</span>    IN      A       54.249.0.0
+foo.beatpacking.com. <span class="m">60</span>    IN      A       54.249.0.0
+foo.beatpacking.com. <span class="m">60</span>    IN      A       176.32.0.0
+foo.beatpacking.com. <span class="m">60</span>    IN      A       46.51.20.0
+foo.beatpacking.com. <span class="m">60</span>    IN      A       46.51.20.0
+foo.beatpacking.com. <span class="m">60</span>    IN      A       54.248.0.0
+foo.beatpacking.com. <span class="m">60</span>    IN      A       54.248.0.0
+foo.beatpacking.com. <span class="m">60</span>    IN      A       54.249.0.0
+
+<span class="p">;;</span> Query time: <span class="m">3</span> msec
+<span class="p">;;</span> SERVER: 172.16.0.23#53<span class="o">(</span>172.16.0.23<span class="o">)</span>
+<span class="p">;;</span> WHEN: Fri Feb <span class="m">19</span> 12:35:50 UTC 2016
+<span class="p">;;</span> MSG SIZE  rcvd: 181
+</pre></div>
+<p>위의 결과와 같이 ELB는 사용량에 따라 여러개의 IP를 반환할 수 있다. <sup class="footnote-ref" id="fnref-1"><a href="#fn-1" rel="footnote">1</a></sup> 
+사실, ELB는 EC2 인스턴스의 집합이며, 내부적으로 ELB 사용량에 따라서 자동으로 Scale-In/Out 되는 관리형 서비스 이기 때문에, 위와 같이 IP가 계속 변동된다.</p>
+<p>비트에서 격었던 문제는, 이런 ELB의 특성과 Nginx의 작동 특성에 기인하여 발생하였다.  보통 Nginx 설정은, <code>upstream</code> 을 선언하여 설정하거나,</p>
+<div class="highlight"><pre><span></span>upstream backend <span class="o">{</span>
+  server  unix:/tmp/gunicorn.sock <span class="nv">max_fails</span><span class="o">=</span><span class="m">0</span> <span class="nv">fail_timeout</span><span class="o">=</span>0<span class="p">;</span> 
+<span class="o">}</span>
+
+location @beat-api <span class="o">{</span>
+    proxy_pass http://backend<span class="p">;</span>
+    proxy_set_header   Host $host<span class="p">;</span>
+    proxy_set_header   X-Real-IP $remote_addr<span class="p">;</span>
+    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for<span class="p">;</span> 
+<span class="o">}</span>
+</pre></div>
+<div class="highlight"><pre><span></span>location @beat-api <span class="o">{</span>
+    proxy_pass http://elb-test.ap-northeast-1.elb.amazonaws.com<span class="p">;</span>
+    proxy_set_header   Host $host<span class="p">;</span>
+    proxy_set_header   X-Real-IP $remote_addr<span class="p">;</span>
+    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for<span class="p">;</span>
+<span class="o">}</span>
+</pre></div>
+<p>혹은 <code>proxy_pass</code> 에 직접 서버 주소를 지정함으로써 처리하게 되는 것이 보통이다. 크게 문제가 될 것이 없어 보이는 이런 설정에서  왜 문제가 발생하게 될까? 위의 dns query결과를 다시 살펴보면,
+    foo.beatpacking.com. 60    IN      A       54.249.0.0
+위와 같이 <code>TTL</code> 이 60초로 짧게 설정되어 있어, IP가 바뀔 경우 빠르게 대응하도록 요구하고 있는데, Nginx의 경우 <strong>설정 파일을 읽는 시점에 해당 DNS에 대한 IP 변환(resolve)를 수행</strong>한다는 점에 있다. 이럴 경우 ELB에 트래픽이 많아져 ELB 스스로 Scale-Up 한 경우에 그 효과를 기대할 수 없을뿐 아니라, 최악의 경우에는 IP가 교체되었음에도 불구하고 여전히 옛날 IP로 요청이 전달되어 오류가 나는 경우까지도 발생한다.</p>
+<p>이 문제를 어떻게 해결해야 할까? nginx의 <a href="http://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass">proxy_module</a> 문서를 살펴 보면, 다음과 같은 부분을 확인해 볼 수 있다.</p>
+<blockquote><p>A server name, its port and the passed URI can also be specified using variables:</p>
+<p><code>proxy_pass http://$host$uri</code>;</p>
+<p>or even like this:</p>
+<p><code>proxy_pass $request;</code></p>
+<p>In this case, the server name is searched among the described server groups, and, if not found, is <em>determined using a resolver</em>.</p>
+</blockquote>
+<p>즉, 변수를 통해서 server 이름이 지정된 경우 항상 <code>resolver</code>를 통한 IP변환을 수행하게 되어 항상 올바른 ELB IP를 사용할 수 있게 된다. 이에 따라, 이런 부분을 반영하면 설정은 다음과 같이 변경된다.</p>
+<div class="highlight"><pre><span></span><span class="c1"># 172.16.0.23은 AWS의 내부 DNS</span>
+<span class="c1"># ELB의 TTL은 60초로 설정되기 때문에, 이보다 짧거나 같은 유효시간을 설정해서  최신의 IP를 사용토록 한다.</span>
+resolver 172.16.0.23 <span class="nv">valid</span><span class="o">=</span>5s<span class="p">;</span>
+
+<span class="nb">set</span> <span class="nv">$e</span>p <span class="s2">&quot;http://elb-test.ap-northeast-1.elb.amazonaws.com&quot;</span><span class="p">;</span>
+location @beat-api <span class="o">{</span>
+    proxy_pass http://<span class="nv">$e</span>p<span class="p">;</span>
+    proxy_set_header   Host $host<span class="p">;</span>
+    proxy_set_header   X-Real-IP $remote_addr<span class="p">;</span>
+    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for<span class="p">;</span>
+<span class="o">}</span>
+</pre></div>
+<p>위와 같이 설정한 후, 대량 Push발송등의 이벤트시에 종종 관찰되던 <code>upstream connection failed/timeout</code> 관련 문제가 해결된 것이 확인되었다.</p>
+<div class="footnotes">
+<hr>
+<ol><li id="fn-1"><p>트래픽 사용량이 없더라도 AZ(Availability Zone)에 따라 최소 1개의 IP가 할당되는 모습을 확인할 수 있다.<a href="#fnref-1" rev="footnote">&#8617;</a></p></li>
+</ol>
+</div>
+
+  </div>
+
+
+  </div>
+  <div class="ga-script">
+<div id="ga-script"></div>
+<script type="text/javascript">
+        (function(i,s,o,g,r,a,m){i['GoogleAnalyticsObject']=r;i[r]=i[r]||function(){
+        (i[r].q=i[r].q||[]).push(arguments)},i[r].l=1*new Date();a=s.createElement(o),
+        m=s.getElementsByTagName(o)[0];a.async=1;a.src=g;m.parentNode.insertBefore(a,m)
+        })(window,document,'script','//www.google-analytics.com/analytics.js','ga');
+        ga('create', 'UA-15617445-2', 'tech.kkung.net');
+        ga('send', 'pageview');
+</script>
+</div>
+</body>
+</html>
